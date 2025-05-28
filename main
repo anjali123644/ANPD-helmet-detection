@@ -1,35 +1,45 @@
-from ultralytics import YOLO
+#final code
 import cv2
+from ultralytics import YOLO
 import numpy as np
 from sort.sort import Sort
-from util import get_car, read_license_plate, write_csv
+import easyocr
+from collections import defaultdict
+import difflib
+
+# Load models
+helmet_model = YOLO(r"D:\APD  and helemt detection\weights\helemet_best (2).pt")
+coco_model = YOLO("yolov8n.pt")
+plate_model = YOLO(r"D:\APD  and helemt detection\weights\plate_best (2).pt")
 
 # Paths
-helmet_model_path = r"D:\APD  and helemt detection\weights\helemet_best (2).pt"
-anpd_model_path = r"D:\APD  and helemt detection\weights\plate_best (2).pt"
-coco_model_path = "yolov8n.pt"
-video_path = r"D:\APD  and helemt detection\Media\14 - Trim.mov"
-output_path = "D:\APD  and helemt detection\Output\merged_output3.avi"
-csv_output_path = "D:\APD  and helemt detection\Output\merged_output3.csv"
+video_path = r"D:\APD  and helemt detection\Media\30.webm"
+output_path = r"D:\APD  and helemt detection\Final_output\29.avi"
 
 # Class IDs
 With_helmet_class_id = 0
 Without_helmet_class_id = 1
 vehicles = [2, 3, 5, 7]  # Motorbike, car, bus, truck
 
-# Load models
-helmet_model = YOLO(helmet_model_path)
-coco_model = YOLO(coco_model_path)
-license_plate_model = YOLO(anpd_model_path)
+# Initialize OCR
+reader = easyocr.Reader(['en'], gpu=False)
 
-# === First Pass: Calculate average helmet area ===
+# Video setup
 cap = cv2.VideoCapture(video_path)
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS)
+out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height))
+
+# Tracker
+mot_tracker = Sort()
+
+# Helmet area calculation
 helmet_areas = []
-
 print("[INFO] First pass: Calculating average helmet area...")
-
-while cap.isOpened():
-    ret, frame = cap.read()
+cap_pass = cv2.VideoCapture(video_path)
+while cap_pass.isOpened():
+    ret, frame = cap_pass.read()
     if not ret:
         break
     results = helmet_model(frame, conf=0.25)[0]
@@ -39,116 +49,128 @@ while cap.isOpened():
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
             area = (x2 - x1) * (y2 - y1)
             helmet_areas.append(area)
-
-cap.release()
-
-# Average helmet area
+cap_pass.release()
 avg_helmet_area = np.mean(helmet_areas) if helmet_areas else 0
 print(f"📊 Average helmet area: {avg_helmet_area:.2f}")
 
-# === Second Pass: Helmet detection + Vehicle tracking + License plate detection ===
-cap = cv2.VideoCapture(video_path)
-width, height = int(cap.get(3)), int(cap.get(4))
-fps = cap.get(cv2.CAP_PROP_FPS)
-out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height))
+# Plate history
+plate_history = defaultdict(lambda: {
+    'texts': [], 'scores': [],
+    'stable_text': '', 'last_text': '', 'stable_count': 0
+})
 
-mot_tracker = Sort()
-results = {}
-plate_text_history = {}
-frame_nmr = -1
-area_threshold_multiplier = 1.5
-
-
+# Utility functions
 def preprocess_plate(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-    blurred = cv2.GaussianBlur(resized, (3, 3), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    resized = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    blur = cv2.GaussianBlur(resized, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return thresh
 
-print("[INFO] Second pass: Processing helmet + ANPD...")
+def ocr_plate(img):
+    results = reader.readtext(img)
+    if not results:
+        return "", 0.0
+    texts = []
+    scores = []
+    for bbox, text, conf in results:
+        clean_text = ''.join(filter(str.isalnum, text.upper()))
+        if clean_text:
+            texts.append(clean_text)
+            scores.append(conf)
+    if not texts:
+        return "", 0.0
+    combined_text = ''.join(texts)
+    avg_conf = sum(scores) / len(scores)
+    return combined_text, avg_conf
 
+def similar_enough(a, b):
+    return difflib.SequenceMatcher(None, a, b).ratio() > 0.7
+
+# Process video
+frame_num = 0
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
-    frame_nmr += 1
-    results[frame_nmr] = {}
+    frame_num += 1
     annotated = frame.copy()
 
-    # --- Helmet detection ---
-    helmet_results = helmet_model(frame, conf=0.4)[0]  # Higher conf to reduce false detections
+    # Helmet Detection
+    helmet_results = helmet_model(frame, conf=0.25)[0]
     for box in helmet_results.boxes:
         cls = int(box.cls)
-
-        # Ignore any class that's not helmet-related
         if cls not in [With_helmet_class_id, Without_helmet_class_id]:
             continue
-
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
         area = (x2 - x1) * (y2 - y1)
-        if cls == With_helmet_class_id and area > avg_helmet_area * area_threshold_multiplier:
-            continue  # Skip large helmets
-
+        if cls == With_helmet_class_id and area > avg_helmet_area * 1.5:
+            continue
         label = "Helmet" if cls == With_helmet_class_id else "No Helmet"
         color = (0, 255, 0) if cls == With_helmet_class_id else (0, 0, 255)
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
         cv2.putText(annotated, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-    # --- Vehicle detection + tracking ---
+    # Vehicle Detection
     detections = coco_model(frame)[0]
     dets_for_sort = [
         [x1, y1, x2, y2, score]
-        for x1, y1, x2, y2, score, class_id in detections.boxes.data.tolist()
-        if int(class_id) in vehicles
+        for x1, y1, x2, y2, score, cls in detections.boxes.data.tolist()
+        if int(cls) in vehicles and score > 0.3
     ]
-    track_ids = mot_tracker.update(np.asarray(dets_for_sort)) if dets_for_sort else []
-
-    for x1, y1, x2, y2, vehicle_id in track_ids:
+    tracks = mot_tracker.update(np.array(dets_for_sort)) if dets_for_sort else []
+    for x1, y1, x2, y2, track_id in tracks:
         cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
-        cv2.putText(annotated, f'Vehicle {int(vehicle_id)}', (int(x1), int(y1) - 10),
+        cv2.putText(annotated, f'Vehicle {int(track_id)}', (int(x1), int(y1) - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-    # --- License plate detection ---
-    plates = license_plate_model(frame, conf=0.25)[0]
-    for plate in plates.boxes.data.tolist():
-        x1, y1, x2, y2, score, class_id = plate
-        xveh1, yveh1, xveh2, yveh2, vehicle_id = get_car([x1, y1, x2, y2, score, class_id], track_ids)
-        if vehicle_id == -1:
-            vehicle_id = f"unknown_{int(x1)}_{int(y1)}"
+    # Plate Detection
+    plates = plate_model(frame, conf=0.25)[0]
+    for box in plates.boxes.data.tolist():
+        x1, y1, x2, y2, score, cls = box
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(width, x2), min(height, y2)
 
-        plate_crop = frame[int(y1):int(y2), int(x1):int(x2)]
-        if plate_crop.size == 0 or plate_crop.shape[0] < 10 or plate_crop.shape[1] < 10:
+        vehicle_id = -1
+        for tx1, ty1, tx2, ty2, tid in tracks:
+            if x1 > tx1 and y1 > ty1 and x2 < tx2 and y2 < ty2:
+                vehicle_id = int(tid)
+                break
+        if vehicle_id == -1:
+            vehicle_id = f"unknown_{x1}_{y1}"
+
+        plate_crop = frame[y1:y2, x1:x2]
+        if plate_crop.size == 0 or plate_crop.shape[0] < 10 or plate_crop.shape[1] < 30:
             continue
 
-        ocr_input = preprocess_plate(plate_crop)
-        license_text, text_score = read_license_plate(ocr_input)
+        prep_img = preprocess_plate(plate_crop)
+        text, conf = ocr_plate(prep_img)
 
-        if license_text:
-            prev = plate_text_history.get(vehicle_id)
-            if not prev or (license_text == prev['text'] or text_score > prev['score']):
-                plate_text_history[vehicle_id] = {
-                    'text': license_text,
-                    'score': text_score,
-                    'count': (prev['count'] + 1) if prev else 1
-                }
+        if text and conf > 0.2:
+            history = plate_history[vehicle_id]
+            history['texts'].append(text)
+            history['scores'].append(conf)
+
+            if len(history['texts']) > 10:
+                history['texts'].pop(0)
+                history['scores'].pop(0)
+
+            voted_text = max(set(history['texts']), key=history['texts'].count)
+
+            if text == history['last_text']:
+                history['stable_count'] += 1
             else:
-                license_text = prev['text']
+                history['stable_count'] = 1
+                history['last_text'] = text
 
-            print(f"Frame {frame_nmr}: Vehicle {vehicle_id} => Plate: {license_text}")
-            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(annotated, license_text, (int(x1), int(y1) - 10),
+            if history['stable_count'] >= 3 and similar_enough(text, voted_text):
+                history['stable_text'] = voted_text
+
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(annotated, history['stable_text'], (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            results[frame_nmr][vehicle_id] = {
-                'vehicle': {'bbox': [xveh1, yveh1, xveh2, yveh2]},
-                'license_plate': {
-                    'bbox': [x1, y1, x2, y2],
-                    'text': license_text,
-                    'bbox_score': score,
-                    'text_score': text_score
-                }
-            }
+            print(f"Frame {frame_num} Vehicle {vehicle_id} Plate: {history['stable_text']}")
 
     out.write(annotated)
     cv2.imshow("Merged Detection", annotated)
@@ -158,8 +180,5 @@ while cap.isOpened():
 cap.release()
 out.release()
 cv2.destroyAllWindows()
-write_csv(results, csv_output_path)
-
 print("\n✅ Detection complete.")
-print(f"📁 Video saved to: {output_path}")
-print(f"📜 CSV saved to: {csv_output_path}")
+print(f"Video saved to: {output_path}")
